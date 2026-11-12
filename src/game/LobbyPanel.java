@@ -4,7 +4,6 @@ import javax.swing.*;
 import java.awt.*;
 import java.util.function.Consumer;
 
-/** 대기실 표시와 사용자 입력만 담당합니다. 소켓이나 서버를 직접 다루지 않습니다. */
 @SuppressWarnings("serial")
 final class LobbyPanel extends JPanel {
     private final DefaultListModel<String> players = new DefaultListModel<>();

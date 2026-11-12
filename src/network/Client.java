@@ -1,6 +1,5 @@
-package client;
+package network;
 
-import server.GameServer;
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
@@ -8,12 +7,11 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
-/** 화면과 독립적인 접속 수명 관리. 방을 만들면 서버도 함께 소유합니다. */
-public final class GameConnection implements AutoCloseable {
+public final class Client implements AutoCloseable {
     private final Socket socket;
     private final BufferedReader input;
     private final BufferedWriter output;
-    private final GameServer hostedServer;
+    private final Server hostedServer;
     private final int playerId;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AtomicBoolean listening = new AtomicBoolean();
@@ -24,13 +22,13 @@ public final class GameConnection implements AutoCloseable {
         return thread;
     });
 
-    public static GameConnection open(boolean host, String address, int port, String nickname) throws IOException {
+    public static Client open(boolean host, String address, int port, String nickname) throws IOException {
         if (port < 1 || port > 65535) throw new IllegalArgumentException("포트 범위: 1~65535");
         if (nickname == null || nickname.isBlank() || nickname.length() > 20
                 || nickname.chars().anyMatch(Character::isISOControl)) {
             throw new IllegalArgumentException("닉네임은 제어문자 없이 1~20자로 입력하세요.");
         }
-        GameServer server = host ? new GameServer(port) : null;
+        Server server = host ? new Server(port) : null;
         if (server != null) {
             Thread thread = new Thread(() -> {
                 try { server.start(); }
@@ -39,14 +37,14 @@ public final class GameConnection implements AutoCloseable {
             thread.setDaemon(true);
             thread.start();
         }
-        try { return new GameConnection(host ? "127.0.0.1" : address, port, nickname, server); }
+        try { return new Client(host ? "127.0.0.1" : address, port, nickname, server); }
         catch (IOException | RuntimeException ex) {
             if (server != null) server.close();
             throw ex;
         }
     }
 
-    private GameConnection(String address, int port, String nickname, GameServer server) throws IOException {
+    private Client(String address, int port, String nickname, Server server) throws IOException {
         hostedServer = server;
         socket = new Socket();
         try {
@@ -72,7 +70,6 @@ public final class GameConnection implements AutoCloseable {
 
     public int playerId() { return playerId; }
 
-    /** 콜백은 수신 스레드에서 호출됩니다. Swing 갱신은 호출자가 EDT로 전달합니다. */
     public void listen(Consumer<String> onMessage, Consumer<String> onDisconnect) {
         if (!listening.compareAndSet(false, true)) throw new IllegalStateException("이미 수신 중입니다.");
         Thread thread = new Thread(() -> {

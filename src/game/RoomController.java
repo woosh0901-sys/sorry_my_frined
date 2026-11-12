@@ -1,6 +1,6 @@
 package game;
 
-import client.GameConnection;
+import network.Client;
 import javax.swing.*;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
@@ -11,7 +11,7 @@ import java.util.List;
 final class RoomController {
     private final JFrame window;
     private final Runnable onLeave;
-    private GameConnection connection;
+    private Client connection;
     private LobbyPanel lobby;
     private boolean ownsServer;
     private boolean connecting;
@@ -34,14 +34,14 @@ final class RoomController {
         progress.setSize(340, 110);
         progress.setLocationRelativeTo(window);
         progress.setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
-        new SwingWorker<GameConnection, Void>() {
+        new SwingWorker<Client, Void>() {
             private String roomInfo;
 
-            @Override protected GameConnection doInBackground() throws Exception {
-                GameConnection connected = GameConnection.open(host, address, port, nickname);
+            @Override protected Client doInBackground() throws Exception {
+                Client connected = Client.open(host, address, port, nickname);
                 String local = "localhost";
                 if (host) {
-                    try { local = GameConnection.localAddresses(); }
+                    try { local = Client.localAddresses(); }
                     catch (java.net.SocketException ignored) { }
                 }
                 roomInfo = host ? "내 방 · 접속 주소: " + local + " / 포트: " + port
@@ -53,7 +53,7 @@ final class RoomController {
                 connecting = false;
                 progress.dispose();
                 try {
-                    GameConnection connected = get();
+                    Client connected = get();
                     if (!window.isDisplayable()) { connected.close(); return; }
                     enterLobby(connected, host, roomInfo);
                 } catch (Exception ex) {
@@ -67,7 +67,7 @@ final class RoomController {
         progress.setVisible(true);
     }
 
-    private void enterLobby(GameConnection connected, boolean host, String info) {
+    private void enterLobby(Client connected, boolean host, String info) {
         connection = connected;
         ownsServer = host;
         roster.clear();
@@ -122,7 +122,7 @@ final class RoomController {
     }
 
     private void disconnect() {
-        GameConnection old = connection;
+        Client old = connection;
         connection = null;
         lobby = null;
         ownsServer = false;

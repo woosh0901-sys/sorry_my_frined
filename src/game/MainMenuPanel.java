@@ -6,7 +6,7 @@ import java.awt.image.BufferedImage;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-@SuppressWarnings("serial") // 화면 객체 자체를 직렬화해서 저장하지 않습니다.
+@SuppressWarnings("serial")
 public final class MainMenuPanel extends JPanel {
     public interface Actions {
         void createRoom();
