@@ -1,4 +1,4 @@
-package game;
+package main;
 
 import javax.swing.*;
 import java.awt.*;
@@ -7,8 +7,8 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 @SuppressWarnings("serial")
-public final class MainMenuPanel extends JPanel {
-    public interface Actions {
+final class MainMenuPanel extends JPanel {
+    interface Actions {
         void createRoom();
         void joinRoom();
         void howToPlay();
@@ -21,7 +21,7 @@ public final class MainMenuPanel extends JPanel {
     private final BufferedImage footer = ImageAssets.load("footer");
     private final Map<JButton, Rectangle> positions = new LinkedHashMap<>();
 
-    public MainMenuPanel(Actions actions) {
+    MainMenuPanel(Actions actions) {
         setLayout(null);
         setBackground(new Color(0x304B46));
         setPreferredSize(new Dimension(1280, 720));
