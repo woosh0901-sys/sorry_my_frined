@@ -2,15 +2,14 @@ package network;
 
 import java.io.*;
 import java.net.*;
-import java.nio.charset.StandardCharsets;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 public final class Client implements AutoCloseable {
     private final Socket socket;
-    private final BufferedReader input;
-    private final BufferedWriter output;
+    private final DataInputStream input;
+    private final DataOutputStream output;
     private final Server hostedServer;
     private final int playerId;
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -51,11 +50,10 @@ public final class Client implements AutoCloseable {
             socket.connect(new InetSocketAddress(address, port), 4000);
             socket.setSoTimeout(4000);
             socket.setTcpNoDelay(true);
-            input = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-            output = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
-            output.write("JOIN\t" + nickname + "\n");
-            output.flush();
-            String reply = readLine();
+            input = new DataInputStream(socket.getInputStream());
+            output = new DataOutputStream(socket.getOutputStream());
+            writeMessage("JOIN\t" + nickname);
+            String reply = readMessage();
             if (reply == null || !reply.startsWith("WELCOME\t")) {
                 throw new IOException(reply == null ? "서버 연결이 종료되었습니다." : reply.replace("ERROR\t", ""));
             }
@@ -72,20 +70,32 @@ public final class Client implements AutoCloseable {
 
     public void listen(Consumer<String> onMessage, Consumer<String> onDisconnect) {
         if (!listening.compareAndSet(false, true)) throw new IllegalStateException("이미 수신 중입니다.");
-        Thread thread = new Thread(() -> {
+        new ListenNetwork(onMessage, onDisconnect).start();
+    }
+
+    private final class ListenNetwork extends Thread {
+        private final Consumer<String> onMessage;
+        private final Consumer<String> onDisconnect;
+
+        ListenNetwork(Consumer<String> onMessage, Consumer<String> onDisconnect) {
+            super("room-receive");
+            this.onMessage = onMessage;
+            this.onDisconnect = onDisconnect;
+            setDaemon(true);
+        }
+
+        @Override public void run() {
             String reason = "서버와 연결이 끊어졌습니다.";
             try {
-                String line;
-                while (!closed.get() && (line = readLine()) != null) onMessage.accept(line);
+                String message;
+                while (!closed.get() && (message = readMessage()) != null) onMessage.accept(message);
             } catch (IOException ex) { reason = "연결 종료: " + ex.getMessage(); }
             finally {
                 boolean unexpected = !closed.get();
                 close();
                 if (unexpected) onDisconnect.accept(reason);
             }
-        }, "room-receive");
-        thread.setDaemon(true);
-        thread.start();
+        }
     }
 
     /** 소켓 전송으로 화면이 멈추지 않도록 전용 스레드에서 순서대로 전송합니다. */
@@ -97,7 +107,7 @@ public final class Client implements AutoCloseable {
         try {
             sender.execute(() -> {
                 if (closed.get()) return;
-                try { output.write(message + "\n"); output.flush(); }
+                try { writeMessage(message); }
                 catch (IOException ex) {
                     // 수신 루프가 종료 이벤트를 전달하도록 소켓만 닫습니다.
                     try { socket.close(); } catch (IOException ignored) { }
@@ -108,16 +118,19 @@ public final class Client implements AutoCloseable {
         }
     }
 
-    private String readLine() throws IOException {
-        StringBuilder line = new StringBuilder();
-        int ch;
-        while ((ch = input.read()) != -1) {
-            if (ch == '\n') return line.toString();
-            if (ch == '\r') continue;
-            if (line.length() >= 2048) throw new IOException("서버 메시지 최대 길이 초과");
-            line.append((char) ch);
+    private void writeMessage(String message) throws IOException {
+        output.writeUTF(message);
+        output.flush();
+    }
+
+    private String readMessage() throws IOException {
+        try {
+            String message = input.readUTF();
+            if (message.length() > 2048) throw new IOException("서버 메시지 최대 길이 초과");
+            return message;
+        } catch (EOFException ex) {
+            return null;
         }
-        return line.length() == 0 ? null : line.toString();
     }
 
     public static String localAddresses() throws SocketException {

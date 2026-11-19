@@ -1,25 +1,23 @@
 package network;
 
-import java.io.BufferedReader;
-import java.io.BufferedWriter;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.OutputStreamWriter;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.Vector;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class Server implements AutoCloseable {
     private static final int MAX_PLAYERS = 4;
 
     private final ServerSocket listener;
-    private final List<ClientHandler> clients = new CopyOnWriteArrayList<>();
+    private final Vector<UserService> clients = new Vector<>();
     private final AtomicBoolean closed = new AtomicBoolean();
     private int nextId = 1;
     private boolean started;
@@ -62,22 +60,23 @@ public final class Server implements AutoCloseable {
         }
         if (started || clients.size() >= MAX_PLAYERS) {
             String error = started ? "GAME_IN_PROGRESS" : "ROOM_FULL";
-            socket.getOutputStream().write(("ERROR\t" + error + "\n").getBytes(StandardCharsets.UTF_8));
-            closeSocket(socket);
+            try (socket) {
+                new DataOutputStream(socket.getOutputStream()).writeUTF("ERROR\t" + error);
+            }
             return;
         }
 
-        ClientHandler client = new ClientHandler(socket);
+        UserService client = new UserService(socket);
         clients.add(client);
         if (closed.get()) {
             clients.remove(client);
             client.close();
             return;
         }
-        new Thread(client, "client-handler").start();
+        client.start();
     }
 
-    private synchronized void receive(ClientHandler client, String message) {
+    private synchronized void receive(UserService client, String message) {
         if (closed.get() || !clients.contains(client)) return;
         String[] parts = message.split("\t", -1);
         String command = parts[0];
@@ -116,7 +115,7 @@ public final class Server implements AutoCloseable {
         }
     }
 
-    private void join(ClientHandler client, String nickname) {
+    private void join(UserService client, String nickname) {
         if (client.name != null) {
             client.send("ERROR\tALREADY_JOINED");
             return;
@@ -134,12 +133,12 @@ public final class Server implements AutoCloseable {
         sendRoster();
     }
 
-    private void startGame(ClientHandler requester) {
+    private void startGame(UserService requester) {
         if (started) {
             requester.send("ERROR\tALREADY_STARTED");
             return;
         }
-        List<ClientHandler> joined = joinedClients();
+        List<UserService> joined = joinedClients();
         if (joined.get(0) != requester) {
             requester.send("ERROR\tHOST_ONLY");
             return;
@@ -156,16 +155,16 @@ public final class Server implements AutoCloseable {
         };
         started = true;
         for (int i = 0; i < joined.size(); i++) {
-            ClientHandler client = joined.get(i);
+            UserService client = joined.get(i);
             client.keys = assignments[i];
             client.send("KEYS\t" + client.keys);
         }
         broadcast("START");
     }
 
-    private List<ClientHandler> joinedClients() {
-        List<ClientHandler> joined = new ArrayList<>();
-        for (ClientHandler client : clients) {
+    private List<UserService> joinedClients() {
+        List<UserService> joined = new ArrayList<>();
+        for (UserService client : clients) {
             if (client.name != null) joined.add(client);
         }
         joined.sort(Comparator.comparingInt(client -> client.id));
@@ -175,7 +174,7 @@ public final class Server implements AutoCloseable {
     private void sendRoster() {
         broadcast("ROSTER_BEGIN");
         boolean host = true;
-        for (ClientHandler client : joinedClients()) {
+        for (UserService client : joinedClients()) {
             broadcast("PLAYER\t" + client.id + "\t" + client.name + "\t" + (host ? "HOST" : "MEMBER"));
             host = false;
         }
@@ -183,16 +182,16 @@ public final class Server implements AutoCloseable {
     }
 
     private void broadcast(String message) {
-        for (ClientHandler client : clients) {
+        for (UserService client : clients) {
             if (client.name != null) client.send(message);
         }
     }
 
-    private synchronized void disconnected(ClientHandler client) {
+    private synchronized void disconnected(UserService client) {
         if (!clients.remove(client) || closed.get() || client.name == null) return;
         if (started) {
             started = false;
-            for (ClientHandler other : clients) other.keys = "";
+            for (UserService other : clients) other.keys = "";
             broadcast("STOP\tPLAYER_LEFT");
         }
         System.out.println("퇴장: " + client.name);
@@ -204,7 +203,8 @@ public final class Server implements AutoCloseable {
         if (!closed.compareAndSet(false, true)) return;
         try { listener.close(); }
         catch (IOException ignored) { }
-        for (ClientHandler client : clients) client.close();
+        // 서버 잠금을 기다리지 않고 소켓을 닫아 읽기와 쓰기를 깨운다.
+        for (UserService client : clients.toArray(new UserService[0])) client.close();
     }
 
     private static void closeSocket(Socket socket) {
@@ -212,24 +212,30 @@ public final class Server implements AutoCloseable {
         catch (IOException ignored) { }
     }
 
-    private final class ClientHandler implements Runnable {
+    private final class UserService extends Thread {
         private final Socket socket;
-        private final BufferedReader input;
-        private final BufferedWriter output;
+        private final DataInputStream input;
+        private final DataOutputStream output;
         private int id;
         private String name;
         private String keys = "";
 
-        ClientHandler(Socket socket) throws IOException {
+        UserService(Socket socket) throws IOException {
+            super("user-service");
             this.socket = socket;
-            input = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-            output = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
+            input = new DataInputStream(socket.getInputStream());
+            output = new DataOutputStream(socket.getOutputStream());
         }
 
         @Override public void run() {
             try {
-                String message;
-                while (!socket.isClosed() && (message = readLine()) != null) receive(this, message);
+                while (!socket.isClosed()) {
+                    String message = input.readUTF();
+                    if (message.length() > 2048) throw new IOException("메시지 최대 길이 초과");
+                    receive(this, message);
+                }
+            } catch (EOFException ignored) {
+                // 상대가 연결을 닫으면 아래에서 퇴장 처리한다.
             } catch (IOException ex) {
                 if (!socket.isClosed()) System.out.println("클라이언트 연결 종료: " + ex.getMessage());
             } finally {
@@ -241,24 +247,11 @@ public final class Server implements AutoCloseable {
         void send(String message) {
             if (socket.isClosed()) return;
             try {
-                output.write(message);
-                output.newLine();
+                output.writeUTF(message);
                 output.flush();
             } catch (IOException ex) {
                 close();
             }
-        }
-
-        private String readLine() throws IOException {
-            StringBuilder line = new StringBuilder();
-            int ch;
-            while ((ch = input.read()) != -1) {
-                if (ch == '\n') return line.toString();
-                if (ch == '\r') continue;
-                if (line.length() >= 2048) throw new IOException("메시지 최대 길이 초과");
-                line.append((char) ch);
-            }
-            return line.length() == 0 ? null : line.toString();
         }
 
         void close() { closeSocket(socket); }
