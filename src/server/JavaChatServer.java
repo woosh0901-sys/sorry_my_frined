@@ -29,6 +29,7 @@ public final class JavaChatServer implements AutoCloseable {
     private final ServerSocket socket;
     private final Vector<UserService> users = new Vector<>();
     private final Consumer<String> log;
+    private int nextPlayerId = 1;
 
     public JavaChatServer(int port, Consumer<String> log) throws IOException {
         this.log = log;
@@ -54,6 +55,7 @@ public final class JavaChatServer implements AutoCloseable {
         return addresses.length() == 0 ? "127.0.0.1" : addresses.toString();
     }
 
+    // 접속 수락과 메시지 처리를 나눠 여러 참가자의 접속을 계속 받는다.
     private final class AcceptServer extends Thread {
         @Override
         public void run() {
@@ -79,7 +81,8 @@ public final class JavaChatServer implements AutoCloseable {
     private final class UserService extends Thread {
         private final Socket clientSocket;
         private DataOutputStream output;
-        private volatile String userName;
+        private String userName;
+        private volatile boolean joined;
 
         UserService(Socket clientSocket) {
             this.clientSocket = clientSocket;
@@ -92,16 +95,9 @@ public final class JavaChatServer implements AutoCloseable {
                 DataInputStream input = new DataInputStream(clientSocket.getInputStream());
                 output = new DataOutputStream(clientSocket.getOutputStream());
 
-                String login = input.readUTF();
-                if (!login.startsWith("/login ") || login.substring(7).isBlank()) return;
-                String name = login.substring(7).trim();
+                if (!join(input.readUTF())) return;
                 clientSocket.setSoTimeout(0);
-                synchronized (this) {
-                    writeOne("Welcome to Java chat server\n");
-                    userName = name;
-                    writeOne(name + "님 환영합니다.\n");
-                }
-                log.accept(name + " 입장");
+                log.accept(userName + " 입장");
 
                 while (!clientSocket.isClosed()) {
                     String message = input.readUTF().trim();
@@ -112,10 +108,50 @@ public final class JavaChatServer implements AutoCloseable {
                 // 연결이 닫히면 아래에서 참가자 목록을 정리한다.
             } finally {
                 users.remove(this);
-                if (userName != null) log.accept(userName + " 퇴장");
+                if (joined) log.accept(userName + " 퇴장");
             }
         }
 
+        // 접속 후 첫 메시지로 참가를 처리하고, 승인 ID나 거절 사유를 보낸다.
+        private boolean join(String request) throws IOException {
+            String[] fields = request.split(" ", 2);
+            if (fields.length != 2 || !fields[0].equals("/JOIN")) {
+                writeOne("/JOIN_ERROR INVALID_REQUEST");
+                return false;
+            }
+
+            String name = fields[1].strip();
+            if (name.isEmpty() || name.length() > 20 || name.chars().anyMatch(Character::isISOControl)) {
+                writeOne("/JOIN_ERROR INVALID_NAME");
+                return false;
+            }
+
+            int playerId = registerName(name);
+            if (playerId == 0) {
+                writeOne("/JOIN_ERROR DUPLICATE_NAME");
+                return false;
+            }
+
+            // 승인 메시지와 환영 문구를 일반 채팅보다 먼저 보낸다.
+            synchronized (this) {
+                joined = true;
+                writeOne("/JOIN_OK " + playerId);
+                writeOne("Welcome to Java chat server\n");
+                writeOne(name + "님 환영합니다.\n");
+            }
+            return true;
+        }
+
+        private int registerName(String name) {
+            // 동시에 접속해도 같은 닉네임을 등록하지 않도록 중복 검사와 ID 발급을 묶는다.
+            synchronized (users) {
+                if (users.stream().anyMatch(user -> name.equals(user.userName))) return 0;
+                userName = name;
+                return nextPlayerId++;
+            }
+        }
+
+        // 여러 참가자의 메시지가 같은 소켓에 동시에 기록되지 않도록 한 건씩 보낸다.
         private synchronized void writeOne(String message) throws IOException {
             output.writeUTF(message);
             output.flush();
@@ -123,7 +159,7 @@ public final class JavaChatServer implements AutoCloseable {
 
         private void writeAll(String message) {
             for (UserService user : users.toArray(new UserService[0])) {
-                if (user.userName == null) continue;
+                if (!user.joined) continue;
                 try {
                     user.writeOne(message);
                 } catch (IOException ex) {
@@ -141,6 +177,7 @@ public final class JavaChatServer implements AutoCloseable {
 
     @Override
     public void close() {
+        // 서버 소켓을 닫아 accept()를 종료하고, 참가자 소켓을 닫아 readUTF()를 깨운다.
         try {
             socket.close();
         } catch (IOException ignored) { }

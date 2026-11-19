@@ -6,7 +6,7 @@ import java.awt.event.ActionEvent;
 import java.awt.geom.RoundRectangle2D;
 import java.awt.image.BufferedImage;
 
-/** Real Swing button: focus, Tab, Space, Enter, mouse and accessible name. */
+/** 버튼 동작은 JButton에 맡기고, 화면에는 PNG 이미지를 그린다. */
 @SuppressWarnings("serial") // 버튼 객체 자체를 직렬화해서 저장하지 않습니다.
 final class ImageButton extends JButton {
     private final BufferedImage artwork;

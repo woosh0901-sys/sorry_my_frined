@@ -25,6 +25,7 @@ public final class JavaChatClientView extends JPanel implements AutoCloseable {
     private final Socket socket = new Socket();
     private DataInputStream input;
     private DataOutputStream output;
+    private int playerId;
 
     private final JLabel roomInfo = new JLabel();
     private final JTextArea messages = new JTextArea();
@@ -66,13 +67,34 @@ public final class JavaChatClientView extends JPanel implements AutoCloseable {
 
     public void connect(String address, int port) throws IOException {
         socket.connect(new InetSocketAddress(address, port), 4000);
+        socket.setSoTimeout(4000);
         input = new DataInputStream(socket.getInputStream());
         output = new DataOutputStream(socket.getOutputStream());
-        sendMessage("/login " + userName);
+        // 첫 응답으로 참가자 ID를 받거나, 거절 사유를 메인 화면에 전달한다.
+        sendMessage("/JOIN " + userName);
+        String[] reply = input.readUTF().split(" ", 2);
+        if (reply.length == 2 && reply[0].equals("/JOIN_ERROR")) {
+            throw new IOException(switch (reply[1]) {
+                case "INVALID_NAME" -> "닉네임은 제어 문자 없이 1~20자로 입력하세요.";
+                case "DUPLICATE_NAME" -> "이미 사용 중인 닉네임이에요.";
+                default -> "서버가 참가 요청을 거절했어요.";
+            });
+        }
+        if (reply.length != 2 || !reply[0].equals("/JOIN_OK")) {
+            throw new IOException("서버에서 올바른 참가 승인 메시지를 받지 못했어요.");
+        }
+        try {
+            playerId = Integer.parseInt(reply[1]);
+            if (playerId < 1) throw new NumberFormatException();
+        } catch (NumberFormatException ex) {
+            throw new IOException("서버에서 올바른 참가자 ID를 받지 못했어요.", ex);
+        }
+        socket.setSoTimeout(0);
     }
 
     public void listen(String info) {
-        roomInfo.setText(info);
+        // 승인 응답은 connect()에서 읽었으므로 이후에는 환영 문구와 채팅을 받는다.
+        roomInfo.setText(info + "   /   참가자 ID: " + playerId);
         new ListenNetwork().start();
         txtInput.requestFocusInWindow();
     }
@@ -83,6 +105,7 @@ public final class JavaChatClientView extends JPanel implements AutoCloseable {
             try {
                 while (!socket.isClosed()) {
                     String message = input.readUTF();
+                    // 수신은 별도 스레드에서 기다리고, 채팅창 갱신은 Swing에 맡긴다.
                     EventQueue.invokeLater(() -> appendText(message));
                 }
             } catch (IOException ex) {

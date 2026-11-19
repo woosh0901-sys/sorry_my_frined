@@ -99,10 +99,12 @@ public final class Main extends JFrame implements MainMenuPanel.Actions {
         new SwingWorker<JavaChatServer, Void>() {
             private String roomInfo;
 
+            // 방을 만들 때만 서버를 열고, 접속 작업은 Swing 이벤트 스레드 밖에서 진행한다.
             @Override
             protected JavaChatServer doInBackground() throws IOException {
                 JavaChatServer server = host ? new JavaChatServer(port, System.out::println) : null;
                 try {
+                    // 클라이언트가 /JOIN_OK와 참가자 ID를 받으면 connect()가 끝난다.
                     next.connect(address, port);
                     roomInfo = server != null ? "방 주소: " + server.localAddresses() + "   /   포트: " + port
                         : "접속 주소: " + address + "   /   포트: " + port;
@@ -127,6 +129,7 @@ public final class Main extends JFrame implements MainMenuPanel.Actions {
                     }
                     hostedServer = server;
                     chat = next;
+                    // 참가가 승인되면 같은 창을 대기실로 바꾸고 채팅 수신을 시작한다.
                     setContentPane(chat);
                     revalidate();
                     repaint();

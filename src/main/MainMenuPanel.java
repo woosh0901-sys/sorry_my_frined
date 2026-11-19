@@ -8,6 +8,7 @@ import java.util.Map;
 
 @SuppressWarnings("serial")
 final class MainMenuPanel extends JPanel {
+    // 패널은 버튼을 그려 주고, 누른 뒤의 동작은 Main에서 전달받는다.
     interface Actions {
         void createRoom();
         void joinRoom();
@@ -44,6 +45,7 @@ final class MainMenuPanel extends JPanel {
         add(button);
     }
 
+    // 배경과 버튼에 같은 배율을 적용해 창 크기를 바꿔도 위치가 맞도록 한다.
     private double scale() { return Math.min(getWidth() / 1280.0, getHeight() / 720.0); }
     private int offsetX(double s) { return (int) Math.round((getWidth() - 1280 * s) / 2); }
     private int offsetY(double s) { return (int) Math.round((getHeight() - 720 * s) / 2); }
