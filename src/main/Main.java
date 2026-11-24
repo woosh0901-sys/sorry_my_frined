@@ -1,6 +1,8 @@
 package main;
 
 import client.JavaChatClientView;
+import game.GamePanel;
+import game.Stage;
 import java.awt.Cursor;
 import java.awt.Dimension;
 import java.awt.EventQueue;
@@ -23,6 +25,7 @@ public final class Main extends JFrame implements MainMenuPanel.Actions {
     private final MainMenuPanel menu;
     private JavaChatClientView chat;
     private JavaChatServer hostedServer;
+    private GamePanel game;
     private boolean connecting;
 
     public static void main(String[] args) {
@@ -129,6 +132,7 @@ public final class Main extends JFrame implements MainMenuPanel.Actions {
                     }
                     hostedServer = server;
                     chat = next;
+                    chat.setGameHandler(Main.this::onGameMessage);
                     // 참가가 승인되면 같은 창을 대기실로 바꾸고 채팅 수신을 시작한다.
                     setContentPane(chat);
                     revalidate();
@@ -143,6 +147,37 @@ public final class Main extends JFrame implements MainMenuPanel.Actions {
         }.execute();
     }
 
+    // 서버가 보낸 게임 진행 메시지. 지금은 시작 신호만 처리하고,
+    // 위치·충돌·클리어 메시지는 서버 담당 코드에서 GamePanel 메서드로 연결한다(docs/game-screen-handoff.md).
+    private void onGameMessage(String message) {
+        String[] fields = message.split(" ");
+        if (fields[0].equals("/START")) {
+            try {
+                showGame(fields.length > 1 ? Integer.parseInt(fields[1]) : 1);
+            } catch (NumberFormatException ignored) { }
+        }
+    }
+
+    // 대기실에서 게임 시작 신호를 받으면 같은 창을 게임 화면으로 바꾼다.
+    private void showGame(int number) {
+        Stage stage = Stage.of(number);
+        if (stage == null || chat == null) return;
+        if (game == null) {
+            game = new GamePanel(new GamePanel.Listener() {
+                @Override public void keyChanged(char key, boolean pressed) {
+                    if (chat != null) chat.sendKey(key, pressed);
+                }
+
+                @Override public void exitRequested() { leaveRoom(); }
+            });
+        }
+        game.startStage(stage);
+        setContentPane(game);
+        revalidate();
+        repaint();
+        game.requestFocusInWindow();
+    }
+
     private void leaveRoom() {
         if (hostedServer != null && JOptionPane.showConfirmDialog(this,
                 "방을 닫으면 참가자의 연결도 종료됩니다. 나갈까요?",
@@ -154,6 +189,7 @@ public final class Main extends JFrame implements MainMenuPanel.Actions {
     }
 
     private void closeRoom() {
+        game = null;
         if (chat != null) {
             chat.close();
             chat = null;

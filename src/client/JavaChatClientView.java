@@ -9,6 +9,9 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.function.Consumer;
 import javax.swing.JButton;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
@@ -26,6 +29,8 @@ public final class JavaChatClientView extends JPanel implements AutoCloseable {
     private DataInputStream input;
     private DataOutputStream output;
     private int playerId;
+    private volatile Consumer<String> gameHandler = message -> { };
+    private final ExecutorService keySender = Executors.newSingleThreadExecutor();
 
     private final JLabel roomInfo = new JLabel();
     private final JTextArea messages = new JTextArea();
@@ -106,7 +111,9 @@ public final class JavaChatClientView extends JPanel implements AutoCloseable {
                 while (!socket.isClosed()) {
                     String message = input.readUTF();
                     // 수신은 별도 스레드에서 기다리고, 채팅창 갱신은 Swing에 맡긴다.
-                    EventQueue.invokeLater(() -> appendText(message));
+                    // 슬래시로 시작하는 메시지는 게임 진행용이라 채팅창 대신 게임 쪽으로 넘긴다.
+                    if (message.startsWith("/")) EventQueue.invokeLater(() -> gameHandler.accept(message.strip()));
+                    else EventQueue.invokeLater(() -> appendText(message));
                 }
             } catch (IOException ex) {
                 if (!socket.isClosed()) {
@@ -158,7 +165,27 @@ public final class JavaChatClientView extends JPanel implements AutoCloseable {
         txtInput.requestFocusInWindow();
     }
 
-    private void sendMessage(String message) throws IOException {
+    /** 게임 진행 메시지(/START 등)를 받을 곳. Swing 스레드에서 불린다. */
+    public void setGameHandler(Consumer<String> handler) {
+        gameHandler = handler;
+    }
+
+    /** 게임 화면의 키 입력을 서버로 보낸다. 예: /KEY W DOWN, /KEY W UP */
+    public void sendKey(char key, boolean pressed) {
+        if (socket.isClosed()) return;
+        String message = "/KEY " + key + (pressed ? " DOWN" : " UP");
+        // 키 입력은 자주 오므로 Swing 스레드를 막지 않게 전송 전용 스레드에서 차례로 보낸다.
+        keySender.execute(() -> {
+            try {
+                sendMessage(message);
+            } catch (IOException ex) {
+                close();
+            }
+        });
+    }
+
+    // 채팅과 키 입력이 다른 스레드에서 보내지므로 한 메시지씩 기록한다.
+    private synchronized void sendMessage(String message) throws IOException {
         output.writeUTF(message);
         output.flush();
     }
@@ -170,6 +197,7 @@ public final class JavaChatClientView extends JPanel implements AutoCloseable {
 
     @Override
     public void close() {
+        keySender.shutdownNow();
         try {
             socket.close();
         } catch (IOException ignored) { }
