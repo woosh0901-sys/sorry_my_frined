@@ -3,6 +3,7 @@ package client;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.EventQueue;
+import java.awt.FlowLayout;
 import java.awt.Font;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
@@ -11,6 +12,8 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import javax.swing.JButton;
 import javax.swing.JLabel;
@@ -30,12 +33,16 @@ public final class JavaChatClientView extends JPanel implements AutoCloseable {
     private DataOutputStream output;
     private int playerId;
     private volatile Consumer<String> gameHandler = message -> { };
-    private final ExecutorService keySender = Executors.newSingleThreadExecutor();
+    private volatile Runnable disconnectHandler = () -> { };
+    private final ExecutorService gameSender = Executors.newSingleThreadExecutor();
+    private final AtomicBoolean closed = new AtomicBoolean();
 
     private final JLabel roomInfo = new JLabel();
+    private final JLabel memberCount = new JLabel();
     private final JTextArea messages = new JTextArea();
     private final JTextField txtInput = new JTextField();
     private final JButton send = new JButton("보내기");
+    private final JButton start = new JButton("게임 시작");
 
     public JavaChatClientView(String userName, Runnable onLeave) {
         super(new BorderLayout(0, 14));
@@ -50,8 +57,15 @@ public final class JavaChatClientView extends JPanel implements AutoCloseable {
         title.setFont(new Font("Malgun Gothic", Font.BOLD, 28));
         JButton leave = new JButton("방 나가기");
         leave.addActionListener(event -> onLeave.run());
+        start.setVisible(false);
+        start.addActionListener(event -> sendGameCommand("/START"));
+        JPanel roomActions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+        roomActions.setOpaque(false);
+        roomActions.add(memberCount);
+        roomActions.add(start);
+        roomActions.add(leave);
         heading.add(title, BorderLayout.CENTER);
-        heading.add(leave, BorderLayout.EAST);
+        heading.add(roomActions, BorderLayout.EAST);
         heading.add(roomInfo, BorderLayout.SOUTH);
         add(heading, BorderLayout.NORTH);
 
@@ -72,6 +86,7 @@ public final class JavaChatClientView extends JPanel implements AutoCloseable {
 
     public void connect(String address, int port) throws IOException {
         socket.connect(new InetSocketAddress(address, port), 4000);
+        socket.setTcpNoDelay(true);
         socket.setSoTimeout(4000);
         input = new DataInputStream(socket.getInputStream());
         output = new DataOutputStream(socket.getOutputStream());
@@ -82,6 +97,8 @@ public final class JavaChatClientView extends JPanel implements AutoCloseable {
             throw new IOException(switch (reply[1]) {
                 case "INVALID_NAME" -> "닉네임은 제어 문자 없이 1~20자로 입력하세요.";
                 case "DUPLICATE_NAME" -> "이미 사용 중인 닉네임이에요.";
+                case "ROOM_FULL" -> "방에 참가할 수 있는 인원이 모두 찼어요.";
+                case "GAME_IN_PROGRESS" -> "이미 게임을 진행 중인 방이에요.";
                 default -> "서버가 참가 요청을 거절했어요.";
             });
         }
@@ -116,13 +133,7 @@ public final class JavaChatClientView extends JPanel implements AutoCloseable {
                     else EventQueue.invokeLater(() -> appendText(message));
                 }
             } catch (IOException ex) {
-                if (!socket.isClosed()) {
-                    EventQueue.invokeLater(() -> {
-                        appendText("서버와의 연결이 종료되었습니다.\n");
-                        txtInput.setEnabled(false);
-                        send.setEnabled(false);
-                    });
-                }
+                connectionLost();
             } finally {
                 close();
             }
@@ -148,10 +159,7 @@ public final class JavaChatClientView extends JPanel implements AutoCloseable {
                 try {
                     sendMessage("[" + userName + "] " + text + "\n");
                 } catch (IOException ex) {
-                    close();
-                    EventQueue.invokeLater(() -> {
-                        if (isShowing()) appendText("메시지를 보낼 수 없습니다.\n");
-                    });
+                    connectionLost();
                 }
                 return null;
             }
@@ -170,18 +178,52 @@ public final class JavaChatClientView extends JPanel implements AutoCloseable {
         gameHandler = handler;
     }
 
+    public void setDisconnectHandler(Runnable handler) {
+        disconnectHandler = handler;
+    }
+
+    public void updateRoom(int hostId, int count) {
+        boolean host = playerId == hostId;
+        memberCount.setText((host ? "방장 · " : "") + count + "/4명");
+        start.setVisible(host);
+        start.setEnabled(host && count >= 2);
+    }
+
+    public void showRoomError(String code) {
+        appendText(switch (code) {
+            case "HOST_ONLY" -> "방장만 게임을 시작할 수 있어요.\n";
+            case "NOT_ENOUGH_PLAYERS" -> "두 명 이상 모이면 시작할 수 있어요.\n";
+            case "GAME_IN_PROGRESS" -> "이미 게임을 진행 중이에요.\n";
+            default -> "게임 요청을 처리할 수 없어요.\n";
+        });
+    }
+
+    public int playerId() {
+        return playerId;
+    }
+
+    public void requestNextStage() {
+        sendGameCommand("/NEXT");
+    }
+
     /** 게임 화면의 키 입력을 서버로 보낸다. 예: /KEY W DOWN, /KEY W UP */
     public void sendKey(char key, boolean pressed) {
-        if (socket.isClosed()) return;
-        String message = "/KEY " + key + (pressed ? " DOWN" : " UP");
-        // 키 입력은 자주 오므로 Swing 스레드를 막지 않게 전송 전용 스레드에서 차례로 보낸다.
-        keySender.execute(() -> {
-            try {
-                sendMessage(message);
-            } catch (IOException ex) {
-                close();
-            }
-        });
+        sendGameCommand("/KEY " + key + (pressed ? " DOWN" : " UP"));
+    }
+
+    private void sendGameCommand(String message) {
+        if (closed.get()) return;
+        try {
+            gameSender.execute(() -> {
+                try {
+                    sendMessage(message);
+                } catch (IOException ex) {
+                    connectionLost();
+                }
+            });
+        } catch (RejectedExecutionException ignored) {
+            // 방이 닫히는 순간에 입력한 키는 전송하지 않는다.
+        }
     }
 
     // 채팅과 키 입력이 다른 스레드에서 보내지므로 한 메시지씩 기록한다.
@@ -197,7 +239,17 @@ public final class JavaChatClientView extends JPanel implements AutoCloseable {
 
     @Override
     public void close() {
-        keySender.shutdownNow();
+        if (closed.compareAndSet(false, true)) closeTransport();
+    }
+
+    private void connectionLost() {
+        if (!closed.compareAndSet(false, true)) return;
+        closeTransport();
+        EventQueue.invokeLater(disconnectHandler);
+    }
+
+    private void closeTransport() {
+        gameSender.shutdownNow();
         try {
             socket.close();
         } catch (IOException ignored) { }
