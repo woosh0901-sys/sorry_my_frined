@@ -11,6 +11,8 @@ import java.awt.Insets;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ExecutionException;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
@@ -26,6 +28,8 @@ public final class Main extends JFrame implements MainMenuPanel.Actions {
     private JavaChatClientView chat;
     private JavaChatServer hostedServer;
     private GamePanel game;
+    private final List<GamePanel.Slot> slots = new ArrayList<>();
+    private int stageNumber;
     private boolean connecting;
 
     public static void main(String[] args) {
@@ -132,11 +136,16 @@ public final class Main extends JFrame implements MainMenuPanel.Actions {
                     }
                     hostedServer = server;
                     chat = next;
-                    chat.setGameHandler(Main.this::onGameMessage);
+                    chat.setGameHandler(message -> {
+                        if (chat == next) onGameMessage(message);
+                    });
+                    chat.setDisconnectHandler(() -> {
+                        if (chat != next) return;
+                        returnToMenu();
+                        if (isDisplayable()) showError("방과의 연결이 종료되었어요.");
+                    });
                     // 참가가 승인되면 같은 창을 대기실로 바꾸고 채팅 수신을 시작한다.
-                    setContentPane(chat);
-                    revalidate();
-                    repaint();
+                    showPanel(chat);
                     chat.listen(roomInfo);
                 } catch (InterruptedException ex) {
                     Thread.currentThread().interrupt();
@@ -147,14 +156,60 @@ public final class Main extends JFrame implements MainMenuPanel.Actions {
         }.execute();
     }
 
-    // 서버가 보낸 게임 진행 메시지. 지금은 시작 신호만 처리하고,
-    // 위치·충돌·클리어 메시지는 서버 담당 코드에서 GamePanel 메서드로 연결한다(docs/game-screen-handoff.md).
+    // 서버가 판정한 상태를 Swing 화면에 반영한다.
     private void onGameMessage(String message) {
-        String[] fields = message.split(" ");
-        if (fields[0].equals("/START")) {
-            try {
-                showGame(fields.length > 1 ? Integer.parseInt(fields[1]) : 1);
-            } catch (NumberFormatException ignored) { }
+        String[] fields = message.split(" ", 5);
+        try {
+            switch (fields[0]) {
+                case "/ROOM" -> {
+                    if (fields.length == 3) chat.updateRoom(Integer.parseInt(fields[1]), Integer.parseInt(fields[2]));
+                }
+                case "/START" -> {
+                    if (fields.length == 2) showGame(Integer.parseInt(fields[1]));
+                }
+                case "/LOBBY" -> showLobby();
+                case "/ERROR" -> {
+                    if (fields.length == 2) chat.showRoomError(fields[1]);
+                }
+                default -> {
+                    if (game != null) updateGame(fields);
+                }
+            }
+        } catch (NumberFormatException ignored) { }
+    }
+
+    private void updateGame(String[] fields) {
+        switch (fields[0]) {
+            case "/SLOT" -> {
+                if (fields.length != 5 || fields[1].length() != 1) return;
+                char key = fields[1].charAt(0);
+                int seat = Integer.parseInt(fields[2]);
+                boolean mine = Integer.parseInt(fields[3]) == chat.playerId();
+                slots.removeIf(slot -> slot.key() == key);
+                slots.add(new GamePanel.Slot(key, fields[4], seat, mine));
+                game.setPlayers(slots);
+            }
+            case "/POS" -> {
+                if (fields.length == 3) game.setPlayerPosition(Double.parseDouble(fields[1]), Double.parseDouble(fields[2]));
+            }
+            case "/OBS" -> {
+                if (fields.length == 4) game.setObstaclePosition(Integer.parseInt(fields[1]),
+                    Double.parseDouble(fields[2]), Double.parseDouble(fields[3]));
+            }
+            case "/HELD" -> {
+                if (fields.length == 3 && fields[1].length() == 1) game.setKeyHeld(fields[1].charAt(0), fields[2].equals("1"));
+            }
+            case "/COIN" -> {
+                if (fields.length == 2) game.setCoinCollected(Integer.parseInt(fields[1]));
+            }
+            case "/HIT" -> {
+                if (fields.length == 2) game.playerHit(Integer.parseInt(fields[1]));
+            }
+            case "/CLEAR" -> {
+                if (fields.length == 3) game.showClear(Long.parseLong(fields[1]), Integer.parseInt(fields[2]),
+                    Stage.of(stageNumber + 1) != null);
+            }
+            default -> { }
         }
     }
 
@@ -165,31 +220,51 @@ public final class Main extends JFrame implements MainMenuPanel.Actions {
         if (game == null) {
             game = new GamePanel(new GamePanel.Listener() {
                 @Override public void keyChanged(char key, boolean pressed) {
-                    if (chat != null) chat.sendKey(key, pressed);
+                    if (chat != null && slots.stream().anyMatch(slot -> slot.mine() && slot.key() == key)) {
+                        chat.sendKey(key, pressed);
+                    }
                 }
 
                 @Override public void exitRequested() { leaveRoom(); }
+                @Override public void nextRequested() { if (chat != null) chat.requestNextStage(); }
             });
+            game.setOnline(true);
         }
+        stageNumber = number;
+        slots.clear();
+        game.setPlayers(slots);
         game.startStage(stage);
-        setContentPane(game);
+        if (getContentPane() != game) showPanel(game);
+        game.requestFocusInWindow();
+    }
+
+    private void showLobby() {
+        game = null;
+        slots.clear();
+        showPanel(chat);
+    }
+
+    private void showPanel(JPanel panel) {
+        setContentPane(panel);
         revalidate();
         repaint();
-        game.requestFocusInWindow();
     }
 
     private void leaveRoom() {
         if (hostedServer != null && JOptionPane.showConfirmDialog(this,
                 "방을 닫으면 참가자의 연결도 종료됩니다. 나갈까요?",
                 "방 나가기", JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION) return;
+        returnToMenu();
+    }
+
+    private void returnToMenu() {
         closeRoom();
-        setContentPane(menu);
-        revalidate();
-        repaint();
+        showPanel(menu);
     }
 
     private void closeRoom() {
         game = null;
+        slots.clear();
         if (chat != null) {
             chat.close();
             chat = null;
@@ -206,10 +281,7 @@ public final class Main extends JFrame implements MainMenuPanel.Actions {
 
     @Override
     public void howToPlay() {
-        JOptionPane.showMessageDialog(this,
-            "한 명이 방을 만들고 친구에게 표시된 IP 주소와 포트를 알려 주세요.\n"
-            + "친구는 참여하기에서 주소와 포트를 입력하면 함께 채팅할 수 있어요.",
-            "게임 방법", JOptionPane.INFORMATION_MESSAGE);
+        JOptionPane.showMessageDialog(this, JOptionPane.INFORMATION_MESSAGE);
     }
 
     @Override

@@ -1,9 +1,11 @@
 package server;
 
+import game.Stage;
 import java.awt.BorderLayout;
 import java.awt.EventQueue;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
+import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
@@ -12,8 +14,15 @@ import java.net.NetworkInterface;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
+import java.util.Comparator;
+import java.util.List;
 import java.util.StringJoiner;
 import java.util.Vector;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import javax.swing.JButton;
 import javax.swing.JFrame;
@@ -29,11 +38,15 @@ public final class JavaChatServer implements AutoCloseable {
     private final ServerSocket socket;
     private final Vector<UserService> users = new Vector<>();
     private final Consumer<String> log;
+    private final ScheduledExecutorService gameClock = Executors.newSingleThreadScheduledExecutor();
     private int nextPlayerId = 1;
+    private GameSession game;
+    private long lastTick;
 
     public JavaChatServer(int port, Consumer<String> log) throws IOException {
         this.log = log;
         socket = new ServerSocket(port);
+        gameClock.scheduleWithFixedDelay(this::tick, 0, 33, TimeUnit.MILLISECONDS);
         new AcceptServer().start();
         log.accept("서버 시작: " + socket.getLocalPort());
     }
@@ -78,93 +91,170 @@ public final class JavaChatServer implements AutoCloseable {
         }
     }
 
+    // 참가 순서, 게임 상태, 전송 순서는 users 잠금 안에서 함께 관리한다.
+    private List<UserService> players() {
+        return users.stream().filter(user -> user.joined).sorted(Comparator.comparingInt(user -> user.playerId)).toList();
+    }
+
+    private void broadcast(List<String> messages) {
+        for (UserService user : users) {
+            if (user.joined) user.send(messages);
+        }
+    }
+
+    private void broadcastRoom() {
+        List<UserService> players = players();
+        if (!players.isEmpty()) broadcast(List.of("/ROOM " + players.get(0).playerId + " " + players.size()));
+    }
+
+    private void receive(UserService user, String message) {
+        String[] fields = message.split(" ", 4);
+        synchronized (users) {
+            if (socket.isClosed() || user.clientSocket.isClosed()) return;
+            switch (fields[0]) {
+                case "/START" -> {
+                    if (fields.length == 1) startGame(user);
+                }
+                case "/KEY" -> {
+                    if (game == null || fields.length != 3 || fields[1].length() != 1) return;
+                    if (!fields[2].equals("DOWN") && !fields[2].equals("UP")) return;
+                    String change = game.changeKey(user.playerId, fields[1].charAt(0), fields[2].equals("DOWN"));
+                    if (change != null) broadcast(List.of(change));
+                }
+                case "/NEXT" -> {
+                    Stage next = game == null ? null : game.nextStage();
+                    if (fields.length == 1 && next != null) startStage(next, players());
+                }
+                default -> {
+                    if (message.startsWith("/") || message.isBlank() || message.length() > 1024) return;
+                    log.accept(message);
+                    broadcast(List.of(message + "\n"));
+                }
+            }
+        }
+    }
+
+    private void startGame(UserService requester) {
+        List<UserService> players = players();
+        if (players.get(0) != requester) requester.send(List.of("/ERROR HOST_ONLY"));
+        else if (game != null) requester.send(List.of("/ERROR GAME_IN_PROGRESS"));
+        else if (players.size() < 2) requester.send(List.of("/ERROR NOT_ENOUGH_PLAYERS"));
+        else startStage(Stage.STAGE_1, players);
+    }
+
+    private void startStage(Stage stage, List<UserService> players) {
+        game = new GameSession(stage, players.stream()
+            .map(user -> new GameSession.Player(user.playerId, user.userName)).toList());
+        lastTick = System.nanoTime();
+        broadcast(game.startMessages());
+    }
+
+    private void tick() {
+        synchronized (users) {
+            if (game == null || socket.isClosed()) return;
+            long now = System.nanoTime();
+            List<String> update = game.step(Math.min(0.05, (now - lastTick) / 1e9));
+            lastTick = now;
+            if (!update.isEmpty()) broadcast(update);
+        }
+    }
+
+    private void removeUser(UserService user) {
+        synchronized (users) {
+            users.remove(user);
+            if (!user.joined || socket.isClosed()) return;
+            if (game != null) {
+                game = null;
+                broadcast(List.of("/LOBBY", "참가자가 나가 게임을 종료했습니다.\n"));
+            }
+            broadcastRoom();
+        }
+    }
+
     private final class UserService extends Thread {
         private final Socket clientSocket;
+        private final BlockingQueue<List<String>> outgoing = new ArrayBlockingQueue<>(64);
+        private final Thread writer;
         private DataOutputStream output;
         private String userName;
-        private volatile boolean joined;
+        private int playerId;
+        private boolean joined;
 
         UserService(Socket clientSocket) {
             this.clientSocket = clientSocket;
+            writer = new Thread(this::writeMessages, "smf-room-writer");
         }
 
         @Override
         public void run() {
             try (clientSocket) {
                 clientSocket.setSoTimeout(4000);
+                clientSocket.setTcpNoDelay(true);
                 DataInputStream input = new DataInputStream(clientSocket.getInputStream());
-                output = new DataOutputStream(clientSocket.getOutputStream());
+                output = new DataOutputStream(new BufferedOutputStream(clientSocket.getOutputStream()));
 
-                if (!join(input.readUTF())) return;
+                String rejection = join(input.readUTF());
+                if (rejection != null) {
+                    output.writeUTF("/JOIN_ERROR " + rejection);
+                    output.flush();
+                    return;
+                }
                 clientSocket.setSoTimeout(0);
+                writer.start();
                 log.accept(userName + " 입장");
 
                 while (!clientSocket.isClosed()) {
                     String message = input.readUTF().trim();
-                    log.accept(message);
-                    writeAll(message + "\n");
+                    receive(this, message);
                 }
             } catch (IOException ex) {
                 // 연결이 닫히면 아래에서 참가자 목록을 정리한다.
             } finally {
-                users.remove(this);
+                closeSocket();
+                removeUser(this);
                 if (joined) log.accept(userName + " 퇴장");
             }
         }
 
         // 접속 후 첫 메시지로 참가를 처리하고, 승인 ID나 거절 사유를 보낸다.
-        private boolean join(String request) throws IOException {
+        private String join(String request) {
             String[] fields = request.split(" ", 2);
-            if (fields.length != 2 || !fields[0].equals("/JOIN")) {
-                writeOne("/JOIN_ERROR INVALID_REQUEST");
-                return false;
-            }
+            if (fields.length != 2 || !fields[0].equals("/JOIN")) return "INVALID_REQUEST";
 
             String name = fields[1].strip();
             if (name.isEmpty() || name.length() > 20 || name.chars().anyMatch(Character::isISOControl)) {
-                writeOne("/JOIN_ERROR INVALID_NAME");
-                return false;
+                return "INVALID_NAME";
             }
 
-            int playerId = registerName(name);
-            if (playerId == 0) {
-                writeOne("/JOIN_ERROR DUPLICATE_NAME");
-                return false;
-            }
-
-            // 승인 메시지와 환영 문구를 일반 채팅보다 먼저 보낸다.
-            synchronized (this) {
-                joined = true;
-                writeOne("/JOIN_OK " + playerId);
-                writeOne("Welcome to Java chat server\n");
-                writeOne(name + "님 환영합니다.\n");
-            }
-            return true;
-        }
-
-        private int registerName(String name) {
-            // 동시에 접속해도 같은 닉네임을 등록하지 않도록 중복 검사와 ID 발급을 묶는다.
             synchronized (users) {
-                if (users.stream().anyMatch(user -> name.equals(user.userName))) return 0;
+                if (game != null) return "GAME_IN_PROGRESS";
+                if (players().size() >= 4) return "ROOM_FULL";
+                if (users.stream().anyMatch(user -> name.equals(user.userName))) return "DUPLICATE_NAME";
                 userName = name;
-                return nextPlayerId++;
+                playerId = nextPlayerId++;
+                // 승인 메시지가 대기실 정보나 게임 메시지보다 먼저 도착해야 한다.
+                send(List.of("/JOIN_OK " + playerId, "Welcome to Java chat server\n", name + "님 환영합니다.\n"));
+                joined = true;
+                broadcastRoom();
             }
+            return null;
         }
 
-        // 여러 참가자의 메시지가 같은 소켓에 동시에 기록되지 않도록 한 건씩 보낸다.
-        private synchronized void writeOne(String message) throws IOException {
-            output.writeUTF(message);
-            output.flush();
+        // 느린 연결 때문에 서버 틱이나 다른 참가자의 전송이 멈추지 않게 한다.
+        private void send(List<String> messages) {
+            if (!clientSocket.isClosed() && !outgoing.offer(messages)) closeSocket();
         }
 
-        private void writeAll(String message) {
-            for (UserService user : users.toArray(new UserService[0])) {
-                if (!user.joined) continue;
-                try {
-                    user.writeOne(message);
-                } catch (IOException ex) {
-                    user.closeSocket();
+        private void writeMessages() {
+            try {
+                while (!clientSocket.isClosed()) {
+                    for (String message : outgoing.take()) output.writeUTF(message);
+                    output.flush();
                 }
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+            } catch (IOException ex) {
+                closeSocket();
             }
         }
 
@@ -172,11 +262,13 @@ public final class JavaChatServer implements AutoCloseable {
             try {
                 clientSocket.close();
             } catch (IOException ignored) { }
+            writer.interrupt();
         }
     }
 
     @Override
     public void close() {
+        gameClock.shutdownNow();
         // 서버 소켓을 닫아 accept()를 종료하고, 참가자 소켓을 닫아 readUTF()를 깨운다.
         try {
             socket.close();

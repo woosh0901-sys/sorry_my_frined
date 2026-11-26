@@ -96,6 +96,7 @@ public final class GamePanel extends JPanel {
     private boolean hasNext;
     private List<Slot> slots = defaultSlots();
     private int ping = -1;
+    private boolean online;
 
     public GamePanel(Listener listener) {
         this.listener = listener;
@@ -132,6 +133,8 @@ public final class GamePanel extends JPanel {
             deaths = 0;
             hitAt = Long.MIN_VALUE / 2;
             clearMillis = -1;
+            held.clear();
+            othersHeld.clear();
             image(next.background());
         });
     }
@@ -193,9 +196,14 @@ public final class GamePanel extends JPanel {
         edt(() -> ping = milliseconds);
     }
 
+    public void setOnline(boolean online) {
+        edt(() -> this.online = online);
+    }
+
     /** 도착 결과를 띄운다. hasNextStage가 true면 Enter로 다음 스테이지를 요청할 수 있다. */
     public void showClear(long elapsedMillis, int totalDeaths, boolean hasNextStage) {
         edt(() -> {
+            releaseAll();
             clearMillis = elapsedMillis;
             clearDeaths = totalDeaths;
             hasNext = hasNextStage;
@@ -237,6 +245,7 @@ public final class GamePanel extends JPanel {
 
     // 키를 누르고 있으면 운영체제가 같은 입력을 반복해 보내므로, 상태가 바뀔 때만 전달한다.
     private void press(char key, boolean pressed) {
+        if (pressed && clearMillis >= 0) return;
         if (pressed ? held.add(key) : held.remove(key)) listener.keyChanged(key, pressed);
     }
 
@@ -363,10 +372,10 @@ public final class GamePanel extends JPanel {
         g.drawImage(image("icon-bandage"), 34, 27, 30, 30, null);
         double x = 74 + text(g, "넘어짐", 17, TEAL, 74, 42) + 10;
         text(g, String.valueOf(deaths), 28, OUTLINE, x, 42);
-        String status = ping >= 0 ? ping + " ms" : "로컬 테스트";
+        String status = ping >= 0 ? ping + " ms" : online ? "서버 연결" : "로컬 테스트";
         double statusWidth = width(g, status, 14) + 30;
         pill(g, 26, 76, statusWidth, 22, new Color(47, 74, 69, 150));
-        g.setColor(ping >= 0 ? new Color(0x5DBB63) : PLAYER[2]);
+        g.setColor(ping >= 0 || online ? new Color(0x5DBB63) : PLAYER[2]);
         g.fill(new Ellipse2D.Double(34, 83, 9, 9));
         text(g, status, 14, CREAM, 49, 87);
 
